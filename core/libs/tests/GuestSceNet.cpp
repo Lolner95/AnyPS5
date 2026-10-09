@@ -2,9 +2,11 @@
 #include "SceTypes.hpp"
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -24,6 +26,8 @@ std::int64_t APS5_VABI sceNetSendto(int, const void*, std::size_t, int, const vo
 std::int64_t APS5_VABI sceNetRecvfrom(int, void*, std::size_t, int, void*, std::uint32_t*);
 int APS5_VABI sceNetSocketClose(int);
 int APS5_VABI sceNetSetsockopt(int, int, int, const void*, std::uint32_t);
+int APS5_VABI sceNetGetsockopt(int, int, int, void*, std::uint32_t*);
+int APS5_VABI sceNetShutdown(int, int);
 int* APS5_VABI sceNetErrnoLoc(void);
 int APS5_VABI sceNetEpollCreate(const char*, int);
 int APS5_VABI sceNetEpollControl(int, int, int, const NetEpollEvent*);
@@ -68,6 +72,79 @@ static void Require(bool condition) {
 
 static bool Failed(std::int64_t result, int error) {
     return result == static_cast<int>(0x80410100u | static_cast<unsigned>(error)) && *sceNetErrnoLoc() == error;
+}
+
+static void CheckNonblocking(int socket, int expected) {
+    int value = -1;
+    std::uint32_t size = sizeof(value);
+    Require(sceNetGetsockopt(socket, 0xffff, 0x1200, &value, &size) == 0);
+    Require(value == expected && size == sizeof(value));
+}
+
+static void CheckWouldBlock(int socket) {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool completed = false;
+    bool timedOut = false;
+    std::thread watchdog([&] {
+        std::unique_lock lock(mutex);
+        if (!changed.wait_for(lock, std::chrono::seconds(2), [&] { return completed; })) {
+            timedOut = true;
+            Require(sceNetShutdown(socket, 2) == 0);
+        }
+    });
+    char pending = 0;
+    const auto result = sceNetRecv(socket, &pending, sizeof(pending), 0);
+    const bool wouldBlock = Failed(result, 35);
+    {
+        std::lock_guard lock(mutex);
+        completed = true;
+    }
+    changed.notify_one();
+    watchdog.join();
+    Require(!timedOut && wouldBlock);
+}
+
+static void CheckAcceptNonblocking(int nonblocking) {
+    const int listener = sceNetSocket("accept-listener", 2, 1, 6);
+    const int client = sceNetSocket("accept-client", 2, 1, 6);
+    Require(listener >= 0 && client >= 0);
+    Require(sceNetSetsockopt(listener, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0);
+    std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(sceNetBind_nid_postfix(listener, address.data(), address.size()) == 0);
+    Require(sceNetListen(listener, 1) == 0);
+    std::uint32_t size = address.size();
+    Require(sceNetGetsockname(listener, address.data(), &size) == 0 && size == address.size());
+    Require(sceNetConnect(client, address.data(), address.size()) == 0);
+    const int accepted = sceNetAccept(listener, nullptr, nullptr);
+    Require(accepted >= 0);
+    CheckNonblocking(accepted, nonblocking);
+    const int opposite = !nonblocking;
+    Require(sceNetSetsockopt(listener, 0xffff, 0x1200, &opposite, sizeof(opposite)) == 0);
+    CheckNonblocking(accepted, nonblocking);
+    if (nonblocking) CheckWouldBlock(accepted);
+    Require(sceNetSetsockopt(accepted, 0xffff, 0x1200, &opposite, sizeof(opposite)) == 0);
+    CheckNonblocking(accepted, opposite);
+    CheckNonblocking(listener, opposite);
+    Require(sceNetSetsockopt(accepted, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0);
+    CheckNonblocking(accepted, nonblocking);
+    CheckNonblocking(listener, opposite);
+
+    const int blocking = 0;
+    const int timeout = 1000000;
+    Require(sceNetSetsockopt(accepted, 0xffff, 0x1200, &blocking, sizeof(blocking)) == 0);
+    Require(sceNetSetsockopt(accepted, 0xffff, 0x1006, &timeout, sizeof(timeout)) == 0);
+    Require(sceNetSetsockopt(client, 0xffff, 0x1006, &timeout, sizeof(timeout)) == 0);
+    const char request = 'a';
+    char response = 0;
+    Require(sceNetSend(client, &request, sizeof(request), 0) == sizeof(request));
+    Require(sceNetRecv(accepted, &response, sizeof(response), 0) == sizeof(response) && response == request);
+    Require(sceNetSend(accepted, &response, sizeof(response), 0) == sizeof(response));
+    response = 0;
+    Require(sceNetRecv(client, &response, sizeof(response), 0) == sizeof(response) && response == request);
+    Require(sceNetSocketClose(accepted) == 0);
+    Require(sceNetSocketClose(client) == 0);
+    Require(sceNetSocketClose(listener) == 0);
 }
 
 static void CheckMessages(int receiver, int sender, const std::array<std::uint8_t, 16>& address) {
@@ -187,6 +264,8 @@ int main() {
         Require(in6addr_loopback_nid_postfix[i] == (i == 15 ? 1 : 0));
     }
     Require(sceNetInit_nid_postfix() == 0);
+    CheckAcceptNonblocking(0);
+    CheckAcceptNonblocking(1);
     CheckAddressText(2, "127.0.0.1");
     CheckAddressText(2, "255.255.255.255");
     CheckAddressText(28, "::1");

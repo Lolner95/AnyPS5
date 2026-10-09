@@ -153,6 +153,16 @@ int native_error() {
 }
 #endif
 
+bool setNonblocking(NativeSocket socket, bool enabled) {
+#ifdef _WIN32
+    u_long value = enabled;
+    return ioctlsocket(socket, FIONBIO, &value) == 0;
+#else
+    const int flags = fcntl(socket, F_GETFL, 0);
+    return flags >= 0 && fcntl(socket, F_SETFL, enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) == 0;
+#endif
+}
+
 struct NativeSocketHandle {
     NativeSocket value;
     explicit NativeSocketHandle(NativeSocket socket) : value(socket) {}
@@ -533,10 +543,12 @@ int APS5_VABI sceNetAccept(int s, void* addr, uint32_t* addrlen) {
         close_socket(accepted);
         return fail(12);
     }
+    if (!setNonblocking(accepted, listener.nonblock)) return fail(native_error());
     Sock connection;
     connection.family = listener.family;
     connection.type = NET_SOCK_STREAM;
     connection.native = std::move(handle);
+    connection.nonblock = listener.nonblock;
     int descriptor;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
@@ -737,14 +749,7 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
     int value = 0;
     std::memcpy(&value, optval, sizeof(value));
     if (optname == NET_SO_NBIO) {
-#ifdef _WIN32
-        u_long enabled = value != 0;
-        if (ioctlsocket(socket.native->value, FIONBIO, &enabled) != 0) return fail(native_error());
-#else
-        const int old_flags = fcntl(socket.native->value, F_GETFL, 0);
-        if (old_flags < 0 || fcntl(socket.native->value, F_SETFL,
-            value ? old_flags | O_NONBLOCK : old_flags & ~O_NONBLOCK) != 0) return fail(native_error());
-#endif
+        if (!setNonblocking(socket.native->value, value != 0)) return fail(native_error());
     } else if (optname == NET_SO_RCVTIMEO || optname == NET_SO_SNDTIMEO) {
         if (value < 0) return fail(NET_EINVAL);
 #ifdef _WIN32
