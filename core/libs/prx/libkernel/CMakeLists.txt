@@ -80,8 +80,10 @@ if(BUILD_TESTING)
     configure_windows_unwind(guest_posix_sem_tests)
     add_test(NAME guest_posix_sem_init COMMAND guest_posix_sem_tests init)
     add_test(NAME guest_posix_sem_post COMMAND guest_posix_sem_tests post)
+    add_test(NAME guest_posix_sem_timedwait COMMAND guest_posix_sem_tests timedwait)
+    set_tests_properties(guest_posix_sem_timedwait PROPERTIES TIMEOUT 20)
     if(WIN32)
-        set_tests_properties(guest_posix_sem_init guest_posix_sem_post PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_posix_sem_init guest_posix_sem_post guest_posix_sem_timedwait PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_library(guest_module_fixture SHARED ${LIBS_INCLUDE_DIR}/tests/GuestModuleFixture.cpp)

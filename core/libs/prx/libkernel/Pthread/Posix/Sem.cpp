@@ -33,9 +33,14 @@ static PosixSemaphore* Get(void* sem) {
     return semaphore;
 }
 
-static int WaitFor(PosixSemaphore* semaphore, const KernelUseconds* usec) {
+static int WaitFor(PosixSemaphore* semaphore, const KernelUseconds* usec, const KernelTimespec* abstime = nullptr) {
     std::unique_lock lock(semaphore->lock);
     const auto ready = [&] { return semaphore->count > 0; };
+    KernelUseconds timeout = 0;
+    if (!ready() && abstime) {
+        if (!PosixThread::RelativeMicroseconds(GUEST_REALTIME_CLOCK, abstime, &timeout)) return Fail(PosixThread::GUEST_EINVAL);
+        usec = &timeout;
+    }
     if (usec) {
         if (!semaphore->available.WaitUntil(lock, TimedWait::DeadlineNanos(*usec), ready)) return Fail(PosixThread::GUEST_ETIMEDOUT);
     } else {
@@ -82,9 +87,7 @@ int APS5_VABI sem_trywait_nid_postfix(void* sem) {
 int APS5_VABI sem_timedwait_nid_postfix(void* sem, const KernelTimespec* abstime) {
     auto* semaphore = Get(sem);
     if (!semaphore) return Fail(PosixThread::GUEST_EINVAL);
-    KernelUseconds usec = 0;
-    if (!PosixThread::RelativeMicroseconds(GUEST_REALTIME_CLOCK, abstime, &usec)) return Fail(PosixThread::GUEST_EINVAL);
-    return WaitFor(semaphore, &usec);
+    return WaitFor(semaphore, nullptr, abstime);
 }
 
 int APS5_VABI sem_reltimedwait_np_nid_postfix(void* sem, uint32_t usec) {
