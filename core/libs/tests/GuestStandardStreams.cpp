@@ -9,10 +9,21 @@
 #include <iterator>
 #include <initializer_list>
 #include <chrono>
-#ifndef _WIN32
+#include <cerrno>
+#include <memory>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 extern "C" {
+void AddPathAlias_nid_no_patch(const char*, const char*);
+void RemovePathAlias_nid_no_patch(const char*);
+void BlockPathAlias_nid_no_patch(const char*);
 FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
 std::size_t APS5_VABI fread_nid_postfix(void*, std::size_t, std::size_t, FileStream*);
 std::size_t APS5_VABI fwrite_nid_postfix(const void*, std::size_t, std::size_t, FileStream*);
@@ -129,7 +140,137 @@ static bool CheckBinaryModes() {
     return correct;
 }
 
-int main() {
+static bool CheckReopenFailure(const std::string& directory, const char* name, const std::string& path,
+        const char* mode, int expectedError, bool dynamic = false, bool flushError = false) {
+    const auto original = directory + "/" + name;
+    auto* native = std::fopen(flushError ? "/dev/full" : original.c_str(), "wb");
+    if (!native) {
+        std::fprintf(stderr, "freopen %s: could not open original stream (host errno %d)\n", name, errno);
+        return false;
+    }
+    char buffer[256]{};
+    bool correct = true;
+    const auto check = [&](bool value, const char* message) {
+        if (!value) {
+            std::fprintf(stderr, "freopen %s: %s\n", name, message);
+            correct = false;
+        }
+    };
+    check(std::setvbuf(native, buffer, _IOFBF, sizeof(buffer)) == 0, "could not buffer original stream");
+    const std::string pending = "pending output";
+    for (const unsigned char character : pending)
+        check(std::fputc(character, native) == character, "could not queue buffered output");
+    if (!flushError) check(std::filesystem::file_size(original) == 0, "output was not buffered");
+#ifdef _WIN32
+    const int descriptor = ::_fileno(native);
+#else
+    const int descriptor = ::fileno(native);
+#endif
+    if (descriptor < 0) {
+        std::fprintf(stderr, "freopen %s: original stream has no host descriptor\n", name);
+        std::fclose(native);
+        return false;
+    }
+#ifdef _WIN32
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    if (handle == INVALID_HANDLE_VALUE) {
+        std::fprintf(stderr, "freopen %s: original descriptor has no Windows handle\n", name);
+        std::fclose(native);
+        return false;
+    }
+#endif
+    auto owner = std::make_unique<FileStream>(native, dynamic);
+    auto* stream = dynamic ? owner.release() : owner.get();
+    stream->SetEncodingError();
+    auto& initial = stream->GuestState();
+    initial.position = reinterpret_cast<unsigned char*>(buffer + 3);
+    initial.readRemaining = 11;
+    initial.writeRemaining = 5;
+    initial.buffer = reinterpret_cast<unsigned char*>(buffer);
+    initial.bufferSize = sizeof(buffer);
+    initial.bufferPadding = 7;
+    initial.lineBufferSize = -static_cast<std::int32_t>(sizeof(buffer));
+    *__error_nid_postfix() = 777;
+    auto* result = freopen_nid_postfix(path.c_str(), mode, stream);
+    const int error = *__error_nid_postfix();
+#ifdef _WIN32
+    DWORD flags = 0;
+    const bool closed = !GetHandleInformation(handle, &flags) && GetLastError() == ERROR_INVALID_HANDLE;
+#else
+    const bool closed = ::fcntl(descriptor, F_GETFD) == -1 && errno == EBADF;
+#endif
+    check(result == nullptr, "expected a null result");
+    if (error != expectedError) {
+        std::fprintf(stderr, "freopen %s: expected guest errno %d, received %d\n", name, expectedError, error);
+        correct = false;
+    }
+    check(closed, "original host descriptor remains open");
+    if (!dynamic) {
+        const auto& guest = stream->GuestState();
+        check(guest.flags == 0 && guest.descriptor == -1, "guest stream still appears open");
+        check(guest.position == nullptr && guest.readRemaining == 0 && guest.writeRemaining == 0 &&
+            guest.buffer == nullptr && guest.bufferSize == 0 && guest.bufferPadding == 0 &&
+            guest.lineBufferSize == 0, "guest buffer state remains set");
+        bool rejected = false;
+        try { stream->GetHandle(); }
+        catch (const std::runtime_error&) { rejected = true; }
+        check(rejected, "closed stream still exposes a native handle");
+    }
+    if (!flushError) {
+        std::ifstream input(original, std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        check(contents == pending, "original buffered output was not flushed");
+    }
+    if (result) fclose_nid_postfix(result);
+    else if (!closed) std::fclose(native);
+    return correct;
+}
+
+static bool CheckReopenFailures(const char* selected = nullptr) {
+    const auto directory = "anyps5-reopen-errors-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (!std::filesystem::create_directory(directory)) {
+        std::fprintf(stderr, "freopen: could not create test directory\n");
+        return false;
+    }
+    const auto alias = "/" + directory + "-unmounted";
+    BlockPathAlias_nid_no_patch(alias.c_str());
+    bool correct = true;
+    bool matched = false;
+    const auto run = [&](const char* name, const std::string& path, const char* mode, int error,
+            bool dynamic = false, bool flushError = false) {
+        if (selected && std::strcmp(selected, name) != 0) return;
+        matched = true;
+        correct &= CheckReopenFailure(directory, name, path, mode, error, dynamic, flushError);
+    };
+    run("blocked", alias + "/file", "rb", 2);
+    run("invalid-mode", directory + "/unused", "invalid", 22);
+    run("empty-path", "", "rb", 2);
+    run("missing", directory + "/missing-file", "rb", 2);
+    run("dynamic", alias + "/file", "rb", 2, true);
+    run("dynamic-missing", directory + "/missing-file", "rb", 2, true);
+#ifdef __linux__
+    run("long-name", directory + "/" + std::string(256, 'x'), "rb", 63);
+    if (!selected || std::strcmp(selected, "symlink-loop") == 0) {
+        std::filesystem::create_symlink("loop", directory + "/loop");
+        run("symlink-loop", directory + "/loop", "rb", 62);
+    }
+    run("flush-error", alias + "/file", "rb", 2, false, true);
+#endif
+    AddPathAlias_nid_no_patch(alias.c_str(), directory.c_str());
+    RemovePathAlias_nid_no_patch(alias.c_str());
+    std::filesystem::remove_all(directory);
+    if (!matched) std::fprintf(stderr, "freopen: unknown or unsupported failure case %s\n", selected);
+    return matched && correct;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) {
+        if (argc <= 3 && std::strcmp(argv[1], "reopen-errors") == 0)
+            return CheckReopenFailures(argc == 3 ? argv[2] : nullptr) ? 0 : 1;
+        std::fprintf(stderr, "Usage: %s [reopen-errors [case]]\n", argv[0]);
+        return 1;
+    }
+    if (!CheckReopenFailures()) return 1;
     Require(_Getmbcurmax_nid_postfix() == 1 && _Getmbcurmax_nid_postfix() == ___mb_cur_max_nid_postfix());
     Require(fdopen_nid_postfix(-1, "rb") == nullptr && *__error_nid_postfix() == 9);
     Require(fdopen_nid_postfix(0, nullptr) == nullptr && *__error_nid_postfix() == 22);

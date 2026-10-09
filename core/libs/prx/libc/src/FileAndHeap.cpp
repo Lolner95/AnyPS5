@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <memory>
 #include <filesystem>
+#include <system_error>
 #include <limits>
 #include <utility>
 #include <cerrno>
@@ -24,6 +25,45 @@ static std::string NativeFileMode(const char* mode) {
 
 static bool WritesFile(const char* mode) {
     return std::strpbrk(mode, "wa+") != nullptr;
+}
+
+static int ReopenError(const std::error_code& error) {
+    if (error == std::errc::operation_not_permitted) return 1;
+    if (error == std::errc::no_such_file_or_directory) return 2;
+    if (error == std::errc::interrupted) return 4;
+    if (error == std::errc::no_such_device_or_address) return 6;
+    if (error == std::errc::bad_file_descriptor) return 9;
+    if (error == std::errc::not_enough_memory) return 12;
+    if (error == std::errc::permission_denied) return 13;
+    if (error == std::errc::device_or_resource_busy) return 16;
+    if (error == std::errc::file_exists) return 17;
+    if (error == std::errc::no_such_device) return 19;
+    if (error == std::errc::not_a_directory) return 20;
+    if (error == std::errc::is_a_directory) return 21;
+    if (error == std::errc::invalid_argument) return 22;
+    if (error == std::errc::too_many_files_open_in_system) return 23;
+    if (error == std::errc::too_many_files_open) return 24;
+    if (error == std::errc::text_file_busy) return 26;
+    if (error == std::errc::file_too_large) return 27;
+    if (error == std::errc::no_space_on_device) return 28;
+    if (error == std::errc::read_only_file_system) return 30;
+    if (error == std::errc::resource_unavailable_try_again) return 35;
+    if (error == std::errc::operation_not_supported || error == std::errc::not_supported) return 45;
+    if (error == std::errc::too_many_symbolic_link_levels) return 62;
+    if (error == std::errc::filename_too_long) return 63;
+#ifdef EDQUOT
+    if (error == std::error_condition(EDQUOT, std::generic_category())) return 69;
+#endif
+    if (error == std::errc::value_too_large) return 84;
+    if (error == std::errc::illegal_byte_sequence) return 86;
+    return 5;
+}
+
+static FileStream* ReopenFailure(FileStream* stream, int error) {
+    stream->CloseForReopen();
+    if (stream->IsDynamic()) delete stream;
+    errno = error;
+    return nullptr;
 }
 
 extern "C" {
@@ -60,19 +100,17 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
         "rb+", "wb+", "ab+", "r+b", "w+b", "a+b"};
     bool valid = false;
     for (const auto* candidate : supported) if (std::strcmp(mode, candidate) == 0) valid = true;
-    if (!valid) { errno = 22; return nullptr; }
+    if (!valid) return ReopenFailure(stream, 22);
+    if (!*filename) return ReopenFailure(stream, 2);
     try {
-        const auto path = *filename ? ResolvePath_nid_no_patch(filename).string() : std::string{};
+        const auto path = ResolvePath_nid_no_patch(filename).string();
         if (stream->Reopen(path.c_str(), NativeFileMode(mode).c_str())) {
-            if (!path.empty() && WritesFile(mode)) RecordWrittenPath_nid_no_patch(path);
+            if (WritesFile(mode)) RecordWrittenPath_nid_no_patch(path);
             return stream;
         }
-        const int error = errno;
-        if (stream->IsDynamic()) delete stream;
-        errno = error;
-        return nullptr;
-    } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
-      catch (const std::filesystem::filesystem_error&) { errno = 5; return nullptr; }
+        return ReopenFailure(stream, ReopenError(std::error_code(errno, std::generic_category())));
+    } catch (const std::bad_alloc&) { return ReopenFailure(stream, 12); }
+      catch (const std::filesystem::filesystem_error& error) { return ReopenFailure(stream, ReopenError(error.code())); }
 }
 
 FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) {

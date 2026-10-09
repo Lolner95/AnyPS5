@@ -66,6 +66,12 @@ public:
     }
 
     GuestFilePrefix& GuestState() { return _guest; }
+    void CloseForReopen() noexcept {
+        _guest = {};
+        encodingError = false;
+        if (auto* handle = std::exchange(_handle, nullptr)) std::fclose(handle);
+    }
+
     bool Reopen(const char* filename, const char* mode) {
         auto* previous = GetHandle();
         _guest = {};
