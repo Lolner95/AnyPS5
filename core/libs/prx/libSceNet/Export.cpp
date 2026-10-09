@@ -72,6 +72,7 @@ constexpr int NET_SOCK_RAW = 3;
 constexpr int NET_SOL_SOCKET = 0xFFFF;
 constexpr int NET_SO_SNDTIMEO = 0x1005;
 constexpr int NET_SO_RCVTIMEO = 0x1006;
+constexpr int NET_SO_ERROR = 0x1007;
 constexpr int NET_SO_NBIO = 0x1200;
 constexpr int NET_MSG_PEEK = 0x2;
 constexpr int NET_MSG_TRUNC = 0x10;
@@ -90,8 +91,9 @@ bool initialize_sockets() {
     return result == 0;
 }
 void close_socket(NativeSocket socket) { closesocket(socket); }
-int native_error() {
-    switch (WSAGetLastError()) {
+int native_error(int error) {
+    switch (error) {
+        case 0: return 0;
         case WSAEWOULDBLOCK: return NET_EAGAIN;
         case WSAEINPROGRESS: return NET_EINPROGRESS;
         case WSAEALREADY: return NET_EALREADY;
@@ -122,8 +124,9 @@ constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
 constexpr int NATIVE_SEND_FLAGS = MSG_NOSIGNAL;
 bool initialize_sockets() { return true; }
 void close_socket(NativeSocket socket) { ::close(socket); }
-int native_error() {
-    switch (errno) {
+int native_error(int error) {
+    switch (error) {
+        case 0: return 0;
         case EAGAIN: return NET_EAGAIN;
 #if EWOULDBLOCK != EAGAIN
         case EWOULDBLOCK: return NET_EAGAIN;
@@ -153,8 +156,19 @@ int native_error() {
 }
 #endif
 
+int native_error() {
+#ifdef _WIN32
+    return native_error(WSAGetLastError());
+#else
+    return native_error(errno);
+#endif
+}
+
 struct NativeSocketHandle {
     NativeSocket value;
+#ifdef _WIN32
+    std::mutex errorMutex;
+#endif
     explicit NativeSocketHandle(NativeSocket socket) : value(socket) {}
     ~NativeSocketHandle() {
         if (value != INVALID_NATIVE_SOCKET) close_socket(value);
@@ -791,6 +805,24 @@ int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint
         case NET_SO_NBIO: value = socket.nonblock ? 1 : 0; break;
         case NET_SO_RCVTIMEO: value = socket.rcv_timeout_us; break;
         case NET_SO_SNDTIMEO: value = socket.snd_timeout_us; break;
+        case NET_SO_ERROR: {
+#ifdef _WIN32
+            std::lock_guard lock(socket.native->errorMutex);
+#endif
+            int error = 0;
+            NativeLength length = sizeof(error);
+            if (::getsockopt(socket.native->value, SOL_SOCKET, SO_ERROR,
+                    reinterpret_cast<char*>(&error), &length) != 0)
+                return fail(native_error());
+#ifdef _WIN32
+            const int cleared = 0;
+            if (error != 0 && ::setsockopt(socket.native->value, SOL_SOCKET, SO_ERROR,
+                    reinterpret_cast<const char*>(&cleared), sizeof(cleared)) != 0)
+                return fail(native_error());
+#endif
+            value = native_error(error);
+            break;
+        }
         default: return fail(NET_EOPNOTSUPP);
     }
     std::memcpy(optval, &value, sizeof(value));

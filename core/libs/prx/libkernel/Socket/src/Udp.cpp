@@ -39,6 +39,7 @@ constexpr auto Invalid = -1;
 #endif
 int Fail(int error) { *__error_nid_postfix() = error; return -1; }
 constexpr int GuestNoSignal = 0x20000;
+constexpr int GuestSocketError = 0x1007;
 int NativeSendFlags(int flags) {
 #ifdef _WIN32
     static_cast<void>(flags);
@@ -47,10 +48,13 @@ int NativeSendFlags(int flags) {
     return flags & GuestNoSignal ? MSG_NOSIGNAL : 0;
 #endif
 }
-int NativeError() {
+int NativeError(int error) {
 #ifdef _WIN32
-    switch (WSAGetLastError()) {
+    switch (error) {
+        case 0: return 0;
         case WSAEWOULDBLOCK: return 35;
+        case WSAEINPROGRESS: return 36;
+        case WSAEALREADY: return 37;
         case WSAEADDRINUSE: return 48;
         case WSAEADDRNOTAVAIL: return 49;
         case WSAEACCES: return 13;
@@ -69,8 +73,11 @@ int NativeError() {
         default: return 5;
     }
 #else
-    switch (errno) {
+    switch (error) {
+        case 0: return 0;
         case EAGAIN: return 35;
+        case EINPROGRESS: return 36;
+        case EALREADY: return 37;
         case EADDRINUSE: return 48;
         case EADDRNOTAVAIL: return 49;
         case EACCES: return 13;
@@ -91,11 +98,21 @@ int NativeError() {
     }
 #endif
 }
+int NativeError() {
+#ifdef _WIN32
+    return NativeError(WSAGetLastError());
+#else
+    return NativeError(errno);
+#endif
+}
 struct Socket {
     NativeSocket value;
     int family;
     int type;
     std::mutex modeMutex;
+#ifdef _WIN32
+    std::mutex errorMutex;
+#endif
     bool nonblocking = false;
     Socket(NativeSocket value, int family, int type) : value(value), family(family), type(type) {}
     ~Socket() {
@@ -251,13 +268,24 @@ int APS5_VABI getsockopt_nid_postfix(int descriptor, int level, int option,
                                     void* value, std::uint32_t* length) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
-    const int nativeOption = Option(option);
+    const int nativeOption = option == GuestSocketError ? SO_ERROR : Option(option);
     if (level != 0xffff || nativeOption == -1) return Fail(42);
     if (!value || !length || *length < sizeof(int)) return Fail(22);
+#ifdef _WIN32
+    std::unique_lock lock(socket->errorMutex, std::defer_lock);
+    if (option == GuestSocketError) lock.lock();
+#endif
     int result = 0;
     socklen_t size = sizeof(result);
     if (::getsockopt(socket->value, SOL_SOCKET, nativeOption, reinterpret_cast<char*>(&result), &size))
         return Fail(NativeError());
+#ifdef _WIN32
+    const int cleared = 0;
+    if (option == GuestSocketError && result != 0 && ::setsockopt(socket->value, SOL_SOCKET, SO_ERROR,
+            reinterpret_cast<const char*>(&cleared), sizeof(cleared)) != 0)
+        return Fail(NativeError());
+#endif
+    if (option == GuestSocketError) result = NativeError(result);
     std::memcpy(value, &result, sizeof(result));
     *length = sizeof(result);
     return 0;
@@ -293,7 +321,11 @@ int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint
     socklen_t size;
     if (!Address(address, length, native, size)) return -1;
     if (native.ss_family != (socket->family == 2 ? AF_INET : AF_INET6)) return Fail(47);
-    return ::connect(socket->value, reinterpret_cast<sockaddr*>(&native), size) ? Fail(NativeError()) : 0;
+    if (::connect(socket->value, reinterpret_cast<sockaddr*>(&native), size) == 0) return 0;
+#ifdef _WIN32
+    if (WSAGetLastError() == WSAEWOULDBLOCK) return Fail(36);
+#endif
+    return Fail(NativeError());
 }
 int APS5_VABI listen_nid_postfix(int descriptor, int backlog) {
     const auto socket = Lookup(descriptor);

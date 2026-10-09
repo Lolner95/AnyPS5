@@ -1,8 +1,10 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "SceTypes.hpp"
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -24,6 +26,7 @@ std::int64_t APS5_VABI sceNetSendto(int, const void*, std::size_t, int, const vo
 std::int64_t APS5_VABI sceNetRecvfrom(int, void*, std::size_t, int, void*, std::uint32_t*);
 int APS5_VABI sceNetSocketClose(int);
 int APS5_VABI sceNetSetsockopt(int, int, int, const void*, std::uint32_t);
+int APS5_VABI sceNetGetsockopt(int, int, int, void*, std::uint32_t*);
 int* APS5_VABI sceNetErrnoLoc(void);
 int APS5_VABI sceNetEpollCreate(const char*, int);
 int APS5_VABI sceNetEpollControl(int, int, int, const NetEpollEvent*);
@@ -181,12 +184,120 @@ static void CheckUnspecifiedIpv6() {
     Require(sceNetSocketClose(receiver) == 0);
 }
 
-int main() {
+static void CheckSocketError(int socket, int expected, bool allowCleared = false) {
+    std::array<int, 2> value{-1, 0x12345678};
+    std::uint32_t length = sizeof(value);
+    *sceNetErrnoLoc() = 777;
+    const int result = sceNetGetsockopt(socket, 0xffff, 0x1007, value.data(), &length);
+    const bool matches = value[0] == expected || (allowCleared && value[0] == 0);
+    if (result != 0 || !matches)
+        std::fprintf(stderr, "SO_ERROR: expected %d, received %d (query result %d, errno %d)\n",
+            expected, value[0], result, *sceNetErrnoLoc());
+    Require(result == 0 && matches);
+    Require(length == sizeof(int) && value[1] == 0x12345678 && *sceNetErrnoLoc() == 777);
+}
+
+static void WaitReady(int socket, std::uint32_t requested, std::uint32_t expected) {
+    const int epoll = sceNetEpollCreate("connection-result", 0);
+    Require(epoll >= 0);
+    NetEpollEvent event{};
+    event.events = requested;
+    event.ident = static_cast<std::uint64_t>(socket);
+    event.data.u32 = 0x12345678;
+    Require(sceNetEpollControl(epoll, 1, socket, &event) == 0);
+    NetEpollEvent ready{};
+    const int result = sceNetEpollWait(epoll, &ready, 1, 5000000);
+    if (result != 1) std::fprintf(stderr, "connection did not become ready: %d\n", result);
+    Require(result == 1 && (ready.events & expected) != 0);
+    Require(ready.ident == event.ident && ready.data.u32 == event.data.u32);
+    Require(sceNetEpollDestroy(epoll) == 0);
+}
+
+#ifdef _WIN32
+static void CheckConcurrentSocketError(int socket, bool allowCleared) {
+    std::array<int, 4> results{};
+    std::array<int, 4> errors{};
+    std::array<std::uint32_t, 4> lengths{};
+    std::array<std::thread, 4> readers;
+    std::barrier start(4);
+    for (std::size_t index = 0; index < readers.size(); ++index) {
+        readers[index] = std::thread([&, index] {
+            lengths[index] = sizeof(int);
+            start.arrive_and_wait();
+            results[index] = sceNetGetsockopt(socket, 0xffff, 0x1007, &errors[index], &lengths[index]);
+        });
+    }
+    for (auto& reader : readers) reader.join();
+    int consumed = 0;
+    for (std::size_t index = 0; index < readers.size(); ++index) {
+        Require(results[index] == 0 && lengths[index] == sizeof(int));
+        Require(errors[index] == 0 || errors[index] == 61);
+        consumed += errors[index] == 61;
+    }
+    const bool correct = consumed == 1 || (allowCleared && consumed == 0);
+    if (!correct) std::fprintf(stderr, "concurrent SO_ERROR: expected one refusal, received %d\n", consumed);
+    Require(correct);
+}
+#endif
+
+static void CheckRefusedConnection() {
+    const int reserved = sceNetSocket("refused-port", 2, 1, 6);
+    const int client = sceNetSocket("refused-client", 2, 1, 6);
+    Require(reserved >= 0 && client >= 0);
+    std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(sceNetBind_nid_postfix(reserved, address.data(), address.size()) == 0);
+    std::uint32_t length = address.size();
+    Require(sceNetGetsockname(reserved, address.data(), &length) == 0 && length == address.size());
+    Require(address[2] != 0 || address[3] != 0);
+    const int nonblocking = 1;
+    Require(sceNetSetsockopt(client, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0);
+    const int started = sceNetConnect(client, address.data(), address.size());
+    const bool immediate = Failed(started, 61);
+    Require(immediate || Failed(started, 36));
+    if (!immediate) WaitReady(client, 4, 4 | 8 | 16);
+
+    int value = 0x12345678;
+    length = sizeof(value) - 1;
+    Require(Failed(sceNetGetsockopt(client, 0xffff, 0x1007, &value, &length), 22));
+    Require(length == sizeof(value) - 1 && value == 0x12345678);
+    length = sizeof(value);
+    Require(Failed(sceNetGetsockopt(client, 0xffff, 0x1007, nullptr, &length), 22));
+    Require(length == sizeof(value));
+    Require(Failed(sceNetGetsockopt(client, 0xffff, 0x1007, &value, nullptr), 22));
+    Require(value == 0x12345678);
+    Require(Failed(sceNetGetsockopt(client, 123, 0x1007, &value, &length), 45));
+    Require(value == 0x12345678 && length == sizeof(value));
+    Require(Failed(sceNetSetsockopt(client, 0xffff, 0x1007, &value, sizeof(value)), 45));
+    CheckSocketError(reserved, 0);
+    CheckSocketError(client, 61, immediate);
+    CheckSocketError(client, 0);
+#ifdef _WIN32
+    const int retry = sceNetConnect(client, address.data(), address.size());
+    const bool retryImmediate = Failed(retry, 61);
+    Require(retryImmediate || Failed(retry, 36));
+    if (!retryImmediate) WaitReady(client, 4, 4 | 8 | 16);
+    CheckConcurrentSocketError(client, retryImmediate);
+    CheckSocketError(client, 0);
+#endif
+    Require(sceNetSocketClose(client) == 0);
+    value = 0x12345678;
+    Require(Failed(sceNetGetsockopt(client, 0xffff, 0x1007, &value, &length), 9));
+    Require(value == 0x12345678 && length == sizeof(value));
+    Require(sceNetSocketClose(reserved) == 0);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "refused-connection") == 0) {
+        Require(sceNetInit_nid_postfix() == 0);
+        CheckRefusedConnection();
+        return 0;
+    }
     for (int i = 0; i < 16; ++i) {
         Require(in6addr_any_nid_postfix[i] == 0);
         Require(in6addr_loopback_nid_postfix[i] == (i == 15 ? 1 : 0));
     }
     Require(sceNetInit_nid_postfix() == 0);
+    CheckRefusedConnection();
     CheckAddressText(2, "127.0.0.1");
     CheckAddressText(2, "255.255.255.255");
     CheckAddressText(28, "::1");
@@ -219,6 +330,19 @@ int main() {
     Require(sceNetSetsockopt(connecting, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0);
     const int started = sceNetConnect(connecting, address.data(), address.size());
     Require(started == 0 || (started == static_cast<int>(0x80410124) && *sceNetErrnoLoc() == 36));
+    WaitReady(connecting, 4, 4);
+    CheckSocketError(connecting, 0);
+    WaitReady(listener, 1, 1);
+    const int connected = sceNetAccept(listener, nullptr, nullptr);
+    Require(connected >= 0);
+    Require(sceNetSetsockopt(connected, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0);
+    CheckSocketError(connected, 0);
+    const char completion = 'C';
+    Require(sceNetSend(connecting, &completion, 1, 0) == 1);
+    char delivered = 0;
+    WaitReady(connected, 1, 1);
+    Require(sceNetRecv(connected, &delivered, 1, 0) == 1 && delivered == completion);
+    Require(sceNetSocketClose(connected) == 0);
     Require(sceNetSocketClose(connecting) == 0);
 
     const int epoll = sceNetEpollCreate("guest-sce-net", 0);
